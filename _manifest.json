@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "id": "maibot-community.affinity-plugin",
+  "version": "1.0.0",
+  "name": "QQ 好感度",
+  "description": "按 QQ 号跨群维护好感度，并按分组为规划器提供关系元数据。",
+  "author": {
+    "name": "MaiBot Community",
+    "url": "https://github.com/MaiM-with-u"
+  },
+  "license": "GPL-v3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/MaiM-with-u/maibot"
+  },
+  "host_application": {"min_version": "1.0.12", "max_version": "1.99.99"},
+  "sdk": {"min_version": "2.7.0", "max_version": "2.99.99"},
+  "dependencies": [],
+  "capabilities": ["send.text"],
+  "i18n": {"default_locale": "zh-CN", "supported_locales": ["zh-CN"]}
+}
