@@ -278,6 +278,7 @@ class AffectionPlugin(MaiBotPlugin):
         self._settlement_lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._session_group_cache: dict[str, bool] = {}
 
     @property
     def store(self) -> AffectionStore:
@@ -423,12 +424,17 @@ class AffectionPlugin(MaiBotPlugin):
         del kwargs
         if not self.config.plugin.enabled or not isinstance(message, dict):
             return {"action": "continue"}
+        session_id = str(message.get("session_id") or "").strip()
         message_info = message.get("message_info")
         if not isinstance(message_info, dict):
             return {"action": "continue"}
         user_info = message_info.get("user_info")
         group_info = message_info.get("group_info")
-        if not isinstance(user_info, dict) or not isinstance(group_info, dict):
+        if not isinstance(group_info, dict):
+            if session_id:
+                self._session_group_cache[session_id] = False
+            return {"action": "continue"}
+        if not isinstance(user_info, dict):
             return {"action": "continue"}
 
         platform = str(message.get("platform") or "").strip().lower()
@@ -438,7 +444,8 @@ class AffectionPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         message_id = str(message.get("message_id") or "").strip()
-        session_id = str(message.get("session_id") or "").strip()
+        if session_id:
+            self._session_group_cache[session_id] = True
         qq_nickname = str(user_info.get("user_nickname") or "").strip()
         group_card = str(user_info.get("user_cardname") or "").strip()
         group_name = str(group_info.get("group_name") or "").strip()
@@ -514,6 +521,30 @@ class AffectionPlugin(MaiBotPlugin):
     def _safe_context_value(value: str) -> str:
         return " ".join(str(value or "").replace("|", " ").split())
 
+    @staticmethod
+    def _normalize_reply_message_id(value: Any) -> str:
+        """兼容模型偶尔把单个 msg_id 错误输出为单元素列表。"""
+
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                return ""
+            value = value[0]
+        return str(value or "").strip()
+
+    def _is_group_session(self, session_id: str) -> bool:
+        """只对已确认的群聊会话启用严格身份守卫。"""
+
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return False
+        cached = self._session_group_cache.get(normalized_session_id)
+        if cached is not None:
+            return cached
+        is_group = self.store.is_known_group_session(normalized_session_id)
+        if is_group:
+            self._session_group_cache[normalized_session_id] = True
+        return is_group
+
     @HookHandler(
         "maisaka.planner.before_request",
         name="inject_affection_relation_index",
@@ -572,8 +603,10 @@ class AffectionPlugin(MaiBotPlugin):
         if not isinstance(tool_calls, list):
             return {"action": "continue"}
         session_id = str(kwargs.get("session_id") or "").strip()
+        enforce_identity = self._is_group_session(session_id)
         filtered_calls: list[dict[str, Any]] = []
         removed_ids: list[str] = []
+        normalized_any_call = False
         for raw_call in tool_calls:
             if not isinstance(raw_call, dict):
                 continue
@@ -582,12 +615,27 @@ class AffectionPlugin(MaiBotPlugin):
                 filtered_calls.append(raw_call)
                 continue
             arguments = function_info.get("arguments")
-            message_id = str(arguments.get("msg_id") or "").strip() if isinstance(arguments, dict) else ""
+            raw_message_id = arguments.get("msg_id") if isinstance(arguments, dict) else ""
+            message_id = self._normalize_reply_message_id(raw_message_id)
+            normalized_call = raw_call
+            if isinstance(arguments, dict) and message_id and raw_message_id != message_id:
+                updated_arguments = dict(arguments)
+                updated_arguments["msg_id"] = message_id
+                updated_function = dict(function_info)
+                updated_function["arguments"] = updated_arguments
+                normalized_call = dict(raw_call)
+                normalized_call["function"] = updated_function
+                normalized_any_call = True
+            if not enforce_identity:
+                filtered_calls.append(normalized_call)
+                continue
             if message_id and self.store.get_message_identity(message_id, session_id=session_id) is not None:
-                filtered_calls.append(raw_call)
+                filtered_calls.append(normalized_call)
                 continue
             removed_ids.append(message_id or "<空>")
         if not removed_ids:
+            if normalized_any_call:
+                return {"action": "continue", "modified_kwargs": {"tool_calls": filtered_calls}}
             return {"action": "continue"}
         self.ctx.logger.error(f"已阻止身份未映射的回复工具调用: msg_id={removed_ids}")
         response = str(kwargs.get("response") or "")
@@ -611,6 +659,8 @@ class AffectionPlugin(MaiBotPlugin):
             return {"action": "continue"}
         identity = self.store.get_message_identity(message_id, session_id=session_id)
         if identity is None:
+            if not self._is_group_session(session_id):
+                return {"action": "continue"}
             self.ctx.logger.error(f"Replyer 身份校验失败: msg_id={message_id}")
             extra_prompt = str(kwargs.get("extra_prompt") or "")
             extra_prompt = (extra_prompt + "\n本次回复目标身份校验失败，不得假设与对方存在亲密关系。").strip()

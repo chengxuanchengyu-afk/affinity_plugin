@@ -12,3 +12,4 @@
 - 改为仅提交 `config.toml.example`，实际 `config.toml` 由 SDK 首次加载时生成并由 Git 忽略。
 - 增加 OpenAI 兼容接口 SSRF 防护，拒绝本机、内网、非公网 DNS 结果及 HTTP 重定向。
 - 在 README 开头增加第三方模型接口的数据传输与隐私提示。
+- 修复私聊被群聊身份守卫误拦截的问题，并兼容 Planner 输出单元素 `msg_id` 列表。
