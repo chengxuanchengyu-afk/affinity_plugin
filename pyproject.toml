@@ -1,0 +1,10 @@
+[project]
+name = "maibot-cross-group-affection-plugin"
+version = "1.0.0"
+description = "MaiBot 跨群好感度插件"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
