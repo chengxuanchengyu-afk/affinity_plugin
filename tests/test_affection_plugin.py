@@ -11,6 +11,7 @@ import pytest
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from plugins.affection_plugin.openai_client import (
+    OpenAICompatibleClient,
     OpenAIResponse,
     normalize_chat_completions_url,
     resolve_public_endpoint,
@@ -101,7 +102,13 @@ def build_group_message(
     group_card: str | None = "群名片",
     nickname: str = "QQ昵称",
     text: str = "你好",
+    mentions: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    raw_message = [
+        {"type": "at", "data": mention}
+        for mention in (mentions or [])
+    ]
+    raw_message.append({"type": "text", "data": text})
     return {
         "message_id": message_id,
         "timestamp": "1722500000.0",
@@ -115,7 +122,7 @@ def build_group_message(
             },
             "group_info": {"group_id": group_id, "group_name": f"群-{group_id}"},
         },
-        "raw_message": [{"type": "text", "data": text}],
+        "raw_message": raw_message,
         "processed_plain_text": text,
     }
 
@@ -203,6 +210,78 @@ async def test_planner_relation_index_uses_message_id_not_nickname(tmp_path: Pat
         assert "QQ=10001" in relation_message
         assert "SID=sid-10001" in relation_message
         assert "分组=陌生人" in relation_message
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_mentioned_group_member_uses_own_affection_without_changing_reply_target(tmp_path: Path) -> None:
+    plugin, _host = await create_test_plugin(tmp_path)
+    try:
+        await plugin.record_group_user(
+            build_group_message(
+                message_id="target-history",
+                user_id="10002",
+                group_id="20001",
+                nickname="被评价用户",
+            )
+        )
+        target_person = plugin.store.get_person("qq", "10002")
+        assert target_person is not None
+        plugin.store.set_score(
+            person=target_person,
+            new_score_cents=3125,
+            group_name=plugin._group_for_score(3125),
+            operator_platform="qq",
+            operator_user_id="90001",
+            reason="测试被提及用户关系",
+        )
+
+        await plugin.record_group_user(
+            build_group_message(
+                message_id="ask-evaluate",
+                user_id="10001",
+                group_id="20002",
+                nickname="提问用户",
+                text="评价一下这位群友",
+                mentions=[
+                    {"target_user_id": "99999", "target_user_nickname": "Bot"},
+                    {
+                        "target_user_id": "10002",
+                        "target_user_nickname": "被评价用户",
+                        "target_user_cardname": "目标群友",
+                    },
+                ],
+            )
+        )
+
+        planner_result = await plugin.inject_planner_affection(
+            session_id="session-20002",
+            messages=[
+                {"role": "system", "content": "稳定系统提示词"},
+                {
+                    "role": "user",
+                    "content": '<message msg_id="ask-evaluate" time="12:00:00" user="提问用户">\n@Bot @目标群友 评价一下',
+                },
+            ],
+        )
+        relation_context = planner_result["modified_kwargs"]["messages"][-1]["content"]
+        assert "msg_id=ask-evaluate|QQ=10001" in relation_context
+        assert "source_msg_id=ask-evaluate|被提及QQ=10002" in relation_context
+        assert "名称=目标群友" in relation_context
+        assert "分组=朋友" in relation_context
+        assert "被提及QQ=99999" not in relation_context
+        assert "不是 reply 工具的回复目标" in relation_context
+
+        replyer_result = await plugin.inject_replyer_affection(
+            session_id="session-20002",
+            reply_message_id="ask-evaluate",
+        )
+        reply_guide = replyer_result["modified_kwargs"]["reply_tool_args"]["reply_guide"]
+        assert "本次回复目标 msg_id=ask-evaluate，QQ号=10001" in reply_guide
+        assert "被提及QQ=10002" in reply_guide
+        assert "分组=朋友" in reply_guide
+        assert "回复对象仍是本条消息发送者" in reply_guide
     finally:
         await plugin.on_unload()
 
@@ -400,6 +479,40 @@ def test_openai_url_pins_public_dns_result(monkeypatch: pytest.MonkeyPatch) -> N
     assert parsed.hostname == "llm.example"
     assert resolved_ip == "93.184.216.34"
     assert port == 443
+
+
+def test_openai_response_accepts_legacy_choice_text() -> None:
+    content, detail = OpenAICompatibleClient._extract_choice_content(
+        {"text": '{"updates":[]}', "finish_reason": "stop"}
+    )
+    assert content == '{"updates":[]}'
+    assert detail == ""
+
+
+def test_openai_response_accepts_exact_json_from_reasoning_content() -> None:
+    content, detail = OpenAICompatibleClient._extract_choice_content(
+        {
+            "message": {
+                "content": None,
+                "reasoning_content": '```json\n{"updates":[]}\n```',
+            },
+            "finish_reason": "stop",
+        }
+    )
+    assert content == '{"updates":[]}'
+    assert detail == ""
+
+
+def test_openai_empty_response_exposes_safe_diagnostics_and_is_retryable() -> None:
+    content, detail = OpenAICompatibleClient._extract_choice_content(
+        {
+            "message": {"content": None, "reasoning_content": "模型分析过程", "refusal": ""},
+            "finish_reason": "length",
+        }
+    )
+    assert content == ""
+    assert detail == "finish_reason=length，reasoning_content=有，refusal=无"
+    assert OpenAICompatibleClient._is_retryable(Exception(f"模型返回了空内容（{detail}）")) is True
 
 
 def test_webui_schema_is_chinese_and_supports_hundredths() -> None:

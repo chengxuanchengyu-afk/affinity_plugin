@@ -62,6 +62,19 @@ class MessageIdentity:
     person: PersonRecord
 
 
+@dataclass(frozen=True, slots=True)
+class MentionIdentity:
+    """一条群消息中被 @ 的、已经存在好感度记录的用户。"""
+
+    source_message_id: str
+    platform: str
+    user_id: str
+    session_id: str
+    mentioned_nickname: str
+    mentioned_card: str
+    person: PersonRecord
+
+
 class AffectionStore:
     """使用 SQLite 保存全局人物、群成员资料和消息身份索引。"""
 
@@ -135,6 +148,20 @@ class AffectionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_message_identity_session
                 ON message_identity(session_id, seen_at DESC);
+
+                CREATE TABLE IF NOT EXISTS message_mentions (
+                    source_message_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    mentioned_user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    mentioned_nickname TEXT NOT NULL DEFAULT '',
+                    mentioned_card TEXT NOT NULL DEFAULT '',
+                    seen_at REAL NOT NULL,
+                    PRIMARY KEY (platform, source_message_id, mentioned_user_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_message_mentions_source
+                ON message_mentions(source_message_id, session_id, seen_at DESC);
 
                 CREATE TABLE IF NOT EXISTS processed_events (
                     event_id TEXT PRIMARY KEY,
@@ -256,6 +283,48 @@ class AffectionStore:
             raise RuntimeError(f"写入用户后无法重新读取: platform={platform}, user_id={user_id}")
         return person
 
+    def replace_message_mentions(
+        self,
+        *,
+        source_message_id: str,
+        platform: str,
+        session_id: str,
+        mentions: list[dict[str, str]],
+        seen_at: float,
+    ) -> None:
+        """保存消息中的 @ 目标；人物尚未发言时也保留引用，之后可自动关联。"""
+
+        normalized_message_id = str(source_message_id or "").strip()
+        normalized_platform = str(platform or "").strip().lower()
+        if not normalized_message_id or not normalized_platform:
+            return
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM message_mentions WHERE platform = ? AND source_message_id = ?",
+                (normalized_platform, normalized_message_id),
+            )
+            for mention in mentions:
+                mentioned_user_id = str(mention.get("user_id") or "").strip()
+                if not mentioned_user_id:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO message_mentions (
+                        source_message_id, platform, mentioned_user_id, session_id,
+                        mentioned_nickname, mentioned_card, seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_message_id,
+                        normalized_platform,
+                        mentioned_user_id,
+                        str(session_id or "").strip(),
+                        str(mention.get("nickname") or "").strip(),
+                        str(mention.get("card") or "").strip(),
+                        float(seen_at),
+                    ),
+                )
+
     def get_person(self, platform: str, user_id: str) -> PersonRecord | None:
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
@@ -349,6 +418,77 @@ class AffectionStore:
                 (normalized_session_id,),
             ).fetchone()
         return row is not None
+
+    def get_message_mentions(
+        self,
+        message_ids: Iterable[str],
+        *,
+        session_id: str = "",
+    ) -> list[MentionIdentity]:
+        """查询指定消息中被 @ 且已经建立全局好感度记录的用户。"""
+
+        normalized_ids = list(dict.fromkeys(str(item or "").strip() for item in message_ids if str(item or "").strip()))
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        normalized_session_id = str(session_id or "").strip()
+        parameters: list[Any] = [*normalized_ids, normalized_session_id, normalized_session_id]
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    mm.source_message_id,
+                    mm.platform,
+                    mm.mentioned_user_id,
+                    mm.session_id,
+                    mm.mentioned_nickname,
+                    mm.mentioned_card,
+                    p.person_sid,
+                    p.qq_nickname,
+                    p.display_name,
+                    p.score_cents,
+                    p.group_name,
+                    p.first_seen_at,
+                    p.last_seen_at,
+                    p.last_delta_cents,
+                    p.last_reason
+                FROM message_mentions AS mm
+                JOIN persons AS p
+                  ON p.platform = mm.platform AND p.user_id = mm.mentioned_user_id
+                WHERE mm.source_message_id IN ({placeholders})
+                  AND (? = '' OR mm.session_id = ?)
+                ORDER BY mm.seen_at ASC, mm.source_message_id ASC, mm.mentioned_user_id ASC
+                """,
+                parameters,
+            ).fetchall()
+
+        mentions: list[MentionIdentity] = []
+        for row in rows:
+            person = PersonRecord(
+                platform=str(row["platform"]),
+                user_id=str(row["mentioned_user_id"]),
+                person_sid=str(row["person_sid"] or ""),
+                qq_nickname=str(row["qq_nickname"] or ""),
+                display_name=str(row["display_name"] or ""),
+                score_cents=int(row["score_cents"]),
+                group_name=str(row["group_name"] or ""),
+                first_seen_at=float(row["first_seen_at"]),
+                last_seen_at=float(row["last_seen_at"]),
+                last_delta_cents=int(row["last_delta_cents"]),
+                last_reason=str(row["last_reason"] or ""),
+            )
+            mentions.append(
+                MentionIdentity(
+                    source_message_id=str(row["source_message_id"]),
+                    platform=str(row["platform"]),
+                    user_id=str(row["mentioned_user_id"]),
+                    session_id=str(row["session_id"] or ""),
+                    mentioned_nickname=str(row["mentioned_nickname"] or ""),
+                    mentioned_card=str(row["mentioned_card"] or ""),
+                    person=person,
+                )
+            )
+        return mentions
 
     def list_persons(self) -> list[PersonRecord]:
         with closing(self._connect()) as connection, connection:

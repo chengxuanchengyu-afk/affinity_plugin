@@ -18,7 +18,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import HookMode, HookOrder
 
 from .openai_client import OpenAICompatibleClient, OpenAICompatibleError
-from .storage import AffectionStore, PendingEventJournal, PersonRecord
+from .storage import AffectionStore, MentionIdentity, PendingEventJournal, PersonRecord
 
 
 SCORE_SCALE = 100
@@ -29,6 +29,8 @@ MAX_EVENTS_PER_SETTLEMENT = 120
 MAX_USERS_PER_SETTLEMENT = 30
 MAX_EVENT_TEXT_LENGTH = 600
 MAX_RELATION_CONTEXT_ITEMS = 20
+MAX_MENTION_CONTEXT_ITEMS = 8
+SETTLEMENT_MAX_TOKENS = 4096
 MESSAGE_ID_PATTERN = re.compile(r'<message\s+[^>]*msg_id="([^"]+)"', re.IGNORECASE)
 
 
@@ -413,6 +415,39 @@ class AffectionPlugin(MaiBotPlugin):
                 text_parts.append(str(data or ""))
         return "".join(text_parts).strip()
 
+    @staticmethod
+    def _extract_message_mentions(message: dict[str, Any]) -> list[dict[str, str]]:
+        """从插件消息载荷中提取去重后的 @ 用户资料。"""
+
+        raw_message = message.get("raw_message")
+        if not isinstance(raw_message, list):
+            return []
+        mentions: list[dict[str, str]] = []
+        seen_user_ids: set[str] = set()
+        for component in raw_message:
+            if not isinstance(component, dict) or str(component.get("type") or "").lower() != "at":
+                continue
+            data = component.get("data")
+            if isinstance(data, dict):
+                user_id = str(
+                    data.get("target_user_id")
+                    or data.get("qq")
+                    or data.get("user_id")
+                    or data.get("id")
+                    or ""
+                ).strip()
+                nickname = str(data.get("target_user_nickname") or data.get("nickname") or data.get("name") or "").strip()
+                card = str(data.get("target_user_cardname") or data.get("card") or "").strip()
+            else:
+                user_id = str(data or "").strip()
+                nickname = ""
+                card = ""
+            if not user_id or user_id in seen_user_ids:
+                continue
+            seen_user_ids.add(user_id)
+            mentions.append({"user_id": user_id, "nickname": nickname, "card": card})
+        return mentions
+
     @HookHandler(
         "chat.receive.after_process",
         name="record_group_user_affection_identity",
@@ -450,6 +485,7 @@ class AffectionPlugin(MaiBotPlugin):
         group_card = str(user_info.get("user_cardname") or "").strip()
         group_name = str(group_info.get("group_name") or "").strip()
         text = self._extract_message_text(message)
+        mentions = self._extract_message_mentions(message)
         timestamp = float(message.get("timestamp") or time.time())
         person_sid = await self._resolve_person_sid(platform, user_id)
 
@@ -466,6 +502,13 @@ class AffectionPlugin(MaiBotPlugin):
                 session_id=session_id,
                 initial_score_cents=INITIAL_SCORE_CENTS,
                 initial_group_name=self._group_for_score(INITIAL_SCORE_CENTS),
+                seen_at=timestamp,
+            )
+            self.store.replace_message_mentions(
+                source_message_id=message_id,
+                platform=platform,
+                session_id=session_id,
+                mentions=mentions,
                 seen_at=timestamp,
             )
             if text and not text.startswith("/"):
@@ -545,6 +588,18 @@ class AffectionPlugin(MaiBotPlugin):
             self._session_group_cache[normalized_session_id] = True
         return is_group
 
+    def _mention_relation_line(self, mention: MentionIdentity) -> str:
+        display_name = mention.mentioned_card or mention.mentioned_nickname or mention.person.display_name
+        return "|".join(
+            [
+                f"source_msg_id={self._safe_context_value(mention.source_message_id)}",
+                f"被提及QQ={self._safe_context_value(mention.user_id)}",
+                f"SID={self._safe_context_value(mention.person.person_sid)}",
+                f"名称={self._safe_context_value(display_name)}",
+                f"分组={self._safe_context_value(mention.person.group_name)}",
+            ]
+        )
+
     @HookHandler(
         "maisaka.planner.before_request",
         name="inject_affection_relation_index",
@@ -559,8 +614,9 @@ class AffectionPlugin(MaiBotPlugin):
         if not isinstance(messages, list):
             return {"action": "continue"}
         session_id = str(kwargs.get("session_id") or "").strip()
+        context_message_ids = self._extract_context_message_ids(messages)
         relation_lines: list[str] = []
-        for message_id in self._extract_context_message_ids(messages):
+        for message_id in context_message_ids:
             identity = self.store.get_message_identity(message_id, session_id=session_id)
             if identity is None:
                 continue
@@ -574,14 +630,29 @@ class AffectionPlugin(MaiBotPlugin):
                     ]
                 )
             )
-        if not relation_lines:
+        mentioned_people = self.store.get_message_mentions(context_message_ids, session_id=session_id)
+        mention_lines = [
+            self._mention_relation_line(mention)
+            for mention in mentioned_people[-MAX_MENTION_CONTEXT_ITEMS:]
+        ]
+        if not relation_lines and not mention_lines:
             return {"action": "continue"}
 
+        relation_sections: list[str] = []
+        if relation_lines:
+            relation_sections.append("【消息发送者索引】\n" + "\n".join(relation_lines))
+        if mention_lines:
+            relation_sections.append(
+                "【消息内容中被 @ 的人物索引】\n"
+                + "\n".join(mention_lines)
+                + "\n这些人物只是该 source_msg_id 消息中被提及、被询问或被评价的对象，不是 reply 工具的回复目标。"
+            )
         relation_context = (
             "【好感度插件关系索引】\n"
-            "以下数据按 msg_id 与真实 QQ 身份绑定。决定回复哪条消息时，只能使用同一 msg_id 对应的分组，"
-            "不得按昵称猜测或把一人的分组用于另一人。分组是后台信息，不得向群成员透露。\n"
-            + "\n".join(relation_lines)
+            "以下数据按 msg_id 与真实 QQ 身份绑定。reply 工具仍必须回复消息发送者；如果消息要求评价被 @ 的群友，"
+            "则从被提及人物索引读取该人的关系资料。不得按昵称猜测、不得混淆发言者与被提及者，"
+            "也不得向群成员透露分组或好感度。\n"
+            + "\n".join(relation_sections)
         )
         updated_messages = list(messages)
         insertion_index = len(updated_messages)
@@ -668,10 +739,22 @@ class AffectionPlugin(MaiBotPlugin):
 
         reply_tool_args = kwargs.get("reply_tool_args")
         updated_args = dict(reply_tool_args) if isinstance(reply_tool_args, dict) else {}
+        mentioned_people = self.store.get_message_mentions([message_id], session_id=session_id)
+        mention_guide = ""
+        if mentioned_people:
+            mention_guide = (
+                "\n本条目标消息还 @ 了以下已有好感度记录的用户；若内容是在询问或评价他们，必须使用对应资料，"
+                "但 reply 工具的回复对象仍是本条消息发送者：\n"
+                + "\n".join(
+                    self._mention_relation_line(mention)
+                    for mention in mentioned_people[:MAX_MENTION_CONTEXT_ITEMS]
+                )
+            )
         exact_guide = (
             f"本次回复目标 msg_id={message_id}，QQ号={identity.user_id}，内部SID={identity.person_sid or '暂无'}。"
             f"其后台关系分组为“{identity.person.group_name}”。必须严格按照群聊提示词中该分组的风格回复，"
             "不得使用其他用户的关系分组，也不得向用户透露分组或好感度信息。"
+            + mention_guide
         )
         existing_guide = str(updated_args.get("reply_guide") or "").strip()
         updated_args["reply_guide"] = f"{exact_guide}\n{existing_guide}".strip()
@@ -891,7 +974,10 @@ class AffectionPlugin(MaiBotPlugin):
                 selected_events.append(event)
 
             client = self._create_model_client()
-            response = await client.generate_json(self._build_settlement_messages(grouped_events, persons))
+            response = await client.generate_json(
+                self._build_settlement_messages(grouped_events, persons),
+                max_tokens=SETTLEMENT_MAX_TOKENS,
+            )
             updates = self._parse_model_updates(response.content, grouped_events, persons)
             async with self._data_lock:
                 self.store.apply_settlement(updates)
