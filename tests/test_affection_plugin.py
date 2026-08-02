@@ -4,12 +4,17 @@ from pathlib import Path
 from typing import Any
 
 import json
+import socket
 
 import pytest
 
 from maibot_sdk.context import PluginContext, PluginPaths
 
-from plugins.affection_plugin.openai_client import OpenAIResponse, normalize_chat_completions_url
+from plugins.affection_plugin.openai_client import (
+    OpenAIResponse,
+    normalize_chat_completions_url,
+    resolve_public_endpoint,
+)
 from plugins.affection_plugin.plugin import AffectionPlugin, cents_to_text
 
 
@@ -265,6 +270,46 @@ def test_openai_url_normalization() -> None:
         normalize_chat_completions_url("https://example.com/v1/chat/completions")
         == "https://example.com/v1/chat/completions"
     )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000/v1",
+        "http://127.0.0.1:8000/v1",
+        "http://10.0.0.1/v1",
+        "http://172.16.0.1/v1",
+        "http://192.168.1.1/v1",
+        "http://169.254.169.254/latest/meta-data",
+        "http://[::1]/v1",
+        "http://[fc00::1]/v1",
+    ],
+)
+def test_openai_url_rejects_non_public_literal_addresses(url: str) -> None:
+    with pytest.raises(ValueError, match="禁止"):
+        normalize_chat_completions_url(url)
+
+
+def test_openai_url_rejects_domain_resolving_to_private_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_getaddrinfo(*args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        del args, kwargs
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.168.1.25", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(ValueError, match="非公网"):
+        resolve_public_endpoint("https://llm.example/v1/chat/completions")
+
+
+def test_openai_url_pins_public_dns_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_getaddrinfo(*args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        del args, kwargs
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    parsed, resolved_ip, port = resolve_public_endpoint("https://llm.example/v1/chat/completions")
+    assert parsed.hostname == "llm.example"
+    assert resolved_ip == "93.184.216.34"
+    assert port == 443
 
 
 def test_webui_schema_is_chinese_and_supports_hundredths() -> None:

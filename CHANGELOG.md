@@ -10,3 +10,5 @@
 - 新增全中文 WebUI 配置字段和 API Key 遮罩输入。
 - 补充 GPL-3.0-or-later 许可证文件并修正插件仓库链接。
 - 改为仅提交 `config.toml.example`，实际 `config.toml` 由 SDK 首次加载时生成并由 Git 忽略。
+- 增加 OpenAI 兼容接口 SSRF 防护，拒绝本机、内网、非公网 DNS 结果及 HTTP 重定向。
+- 在 README 开头增加第三方模型接口的数据传输与隐私提示。

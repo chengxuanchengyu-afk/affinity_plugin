@@ -1,0 +1,42 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[model]
+# 可填写 https://api.example.com/v1，或完整的 /chat/completions 地址。
+# 仅允许公网地址；localhost、本机、内网及其他非公网地址会被拒绝。
+base_url = ""
+# WebUI 中会使用密码输入框遮罩；配置文件本身仍保存在本机。
+api_key = ""
+model_name = ""
+settlement_interval_minutes = 10
+# 首次失败后的重试次数；2 表示最多总共尝试 3 次。
+retry_count = 2
+
+[change]
+max_increase = 5.00
+max_decrease = 8.00
+
+[admins]
+# 只填写 QQ号，不添加 qq: 前缀。
+qq_ids = []
+
+[[groups]]
+name = "陌生人"
+min_score = 0.00
+max_score = 25.00
+
+[[groups]]
+name = "朋友"
+min_score = 25.01
+max_score = 50.00
+
+[[groups]]
+name = "知己"
+min_score = 50.01
+max_score = 75.00
+
+[[groups]]
+name = "信任"
+min_score = 75.01
+max_score = 100.00
