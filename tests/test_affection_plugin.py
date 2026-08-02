@@ -120,6 +120,31 @@ def build_group_message(
     }
 
 
+def build_private_message(
+    *,
+    message_id: str,
+    user_id: str = "10001",
+    nickname: str = "私聊用户",
+    text: str = "你好",
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "timestamp": "1722500000.0",
+        "platform": "qq",
+        "session_id": f"private-session-{user_id}",
+        "message_info": {
+            "user_info": {
+                "user_id": user_id,
+                "user_nickname": nickname,
+                "user_cardname": "",
+            },
+            "group_info": None,
+        },
+        "raw_message": [{"type": "text", "data": text}],
+        "processed_plain_text": text,
+    }
+
+
 @pytest.mark.asyncio
 async def test_cross_group_user_reuses_global_affection(tmp_path: Path) -> None:
     plugin, _host = await create_test_plugin(tmp_path)
@@ -230,6 +255,71 @@ async def test_replyer_hook_uses_exact_message_identity(tmp_path: Path) -> None:
         assert "QQ号=10001" in updated_args["reply_guide"]
         assert "关系分组为“陌生人”" in updated_args["reply_guide"]
         assert "保持简短" in updated_args["reply_guide"]
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_private_chat_reply_is_not_blocked_and_list_message_id_is_normalized(tmp_path: Path) -> None:
+    plugin, _host = await create_test_plugin(tmp_path)
+    try:
+        await plugin.record_group_user(build_private_message(message_id="315011528"))
+        result = await plugin.guard_planner_reply_identity(
+            session_id="private-session-10001",
+            response="准备回复",
+            tool_calls=[
+                {
+                    "id": "call-private",
+                    "function": {
+                        "name": "reply",
+                        "arguments": {"msg_id": ["315011528"], "reply_guide": "正常私聊回复"},
+                    },
+                }
+            ],
+        )
+        modified_calls = result["modified_kwargs"]["tool_calls"]
+        assert modified_calls[0]["function"]["arguments"]["msg_id"] == "315011528"
+        assert "response" not in result["modified_kwargs"]
+
+        replyer_result = await plugin.inject_replyer_affection(
+            session_id="private-session-10001",
+            reply_message_id="315011528",
+        )
+        assert replyer_result == {"action": "continue"}
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_group_chat_still_blocks_unmapped_reply_target(tmp_path: Path) -> None:
+    plugin, _host = await create_test_plugin(tmp_path)
+    try:
+        await plugin.record_group_user(build_group_message(message_id="known-group-message"))
+        known_result = await plugin.guard_planner_reply_identity(
+            session_id="session-20001",
+            response="准备回复",
+            tool_calls=[
+                {
+                    "id": "call-known-group",
+                    "function": {"name": "reply", "arguments": {"msg_id": ["known-group-message"]}},
+                }
+            ],
+        )
+        known_calls = known_result["modified_kwargs"]["tool_calls"]
+        assert known_calls[0]["function"]["arguments"]["msg_id"] == "known-group-message"
+
+        result = await plugin.guard_planner_reply_identity(
+            session_id="session-20001",
+            response="准备回复",
+            tool_calls=[
+                {
+                    "id": "call-group",
+                    "function": {"name": "reply", "arguments": {"msg_id": "unknown-message"}},
+                }
+            ],
+        )
+        assert result["modified_kwargs"]["tool_calls"] == []
+        assert "身份校验未通过" in result["modified_kwargs"]["response"]
     finally:
         await plugin.on_unload()
 

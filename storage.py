@@ -303,8 +303,8 @@ class AffectionStore:
                 JOIN persons AS p
                   ON p.platform = mi.platform AND p.user_id = mi.user_id
                 WHERE mi.message_id = ?
-                ORDER BY CASE WHEN mi.session_id = ? AND ? <> '' THEN 0 ELSE 1 END,
-                         mi.seen_at DESC
+                  AND (? = '' OR mi.session_id = ?)
+                ORDER BY mi.seen_at DESC
                 LIMIT 1
                 """,
                 (message_id, session_id, session_id),
@@ -336,6 +336,19 @@ class AffectionStore:
             group_card=str(row["group_card"] or ""),
             person=person,
         )
+
+    def is_known_group_session(self, session_id: str) -> bool:
+        """判断会话是否曾由插件确认属于群聊。"""
+
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return False
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT 1 FROM group_memberships WHERE session_id = ? LIMIT 1",
+                (normalized_session_id,),
+            ).fetchone()
+        return row is not None
 
     def list_persons(self) -> list[PersonRecord]:
         with closing(self._connect()) as connection, connection:
